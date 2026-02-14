@@ -1,4 +1,4 @@
-use crate::model::SaturationModel;
+use crate::model_legacy::SaturationModel;
 
 pub struct GainTable {
     points: Vec<(f32, f32)>, // (drive, net_gain) sorted by drive
@@ -34,7 +34,7 @@ impl GainTable {
         drives: &[f32],
         ref_drive: f32,
     ) -> Vec<(f32, f32)> {
-        use lib_audio::signal::Signal;
+        use keystone::signal::Signal;
 
         let test_len = 1024;
         let num_trials = 20;

@@ -1,9 +1,12 @@
 [package]
-name = "lib_neural"
+name = "torchline"
 version = "0.1.0"
+description = "A realtime safe audio inference library for torch models"
 edition = "2021"
 
 [dependencies]
 serde_json = "1.0.149"
-lib_audio = { path = "../lib_audio" }
+serde = { version = "1.0.152", features = ["derive"] }
+keystone = { path = "../keystone" }
+granite = { path = "../granite" }
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", default-features = false, features = ["assert_process_allocs"] }

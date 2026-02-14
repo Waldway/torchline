@@ -1,385 +1,136 @@
-// ============================================================
-// Real-time safe neural network layers — zero heap allocation
-// All sizes known at compile time via const generics.
-// ============================================================
+use crate::json_loader::{LayerJson, ModelJson};
+use crate::types::Activation;
+use granite::{Matrix, Vector};
 
-use std::f32;
-
-#[inline(always)]
-fn tanh_fast(x: f32) -> f32 {
-    x.tanh()
+// DENSE LAYER
+pub struct DenseLayer<const IN: usize, const OUT: usize> {
+    weights: Matrix<OUT, IN>,
+    bias: Vector<OUT>,
+    activation: Activation,
 }
 
-#[inline(always)]
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
+// Here not only generate a deterministically sized Matrix from vectors, but we also transpose from
+// our Torch matrix notation to regular linalg matrices: [IN][OUT] -> [OUT][IN]
+fn vecs_to_matrix<const OUT: usize, const IN: usize>(w: &Vec<Vec<f32>>) -> Matrix<OUT, IN> {
+    let mut m = Matrix::<OUT, IN>::new();
+    for i in 0..IN {
+        for o in 0..OUT {
+            m[o][i] = w[i][o];
+        }
+    }
+    m
 }
 
-// ============================================================
-// Dense layer: y = W * x + b
-// ============================================================
-
-pub struct Dense<const IN: usize, const OUT: usize> {
-    pub weights: [[f32; IN]; OUT],
-    pub bias: [f32; OUT],
+fn vec_to_vector<const N: usize>(v: &Vec<f32>) -> Vector<N> {
+    let mut vector = Vector::<N>::new();
+    for i in 0..N {
+        vector[i] = v[i];
+    }
+    vector
 }
 
-impl<const IN: usize, const OUT: usize> Dense<IN, OUT> {
-    pub fn zeros() -> Self {
+impl<const IN: usize, const OUT: usize> DenseLayer<IN, OUT> {
+    pub fn new(weights: Matrix<OUT, IN>, bias: Vector<OUT>, activation: Activation) -> Self {
         Self {
-            weights: [[0.0; IN]; OUT],
-            bias: [0.0; OUT],
+            weights,
+            bias,
+            activation,
         }
     }
 
-    #[inline]
-    pub fn forward(&self, input: &[f32; IN], output: &mut [f32; OUT]) {
-        for i in 0..OUT {
-            let mut sum = self.bias[i];
-            for j in 0..IN {
-                sum += self.weights[i][j] * input[j];
-            }
-            output[i] = sum;
-        }
+    pub fn forward(&self, input: Vector<IN>) -> Vector<OUT> {
+        let logit = self.weights * input + self.bias;
+        self.activation.process(logit)
     }
 }
 
-// ============================================================
-// Conv1D (causal, no dilation) with ring buffer
-// ============================================================
-
-pub struct Conv1D<const IN_CH: usize, const OUT_CH: usize, const KERNEL: usize> {
-    pub weights: [[[f32; KERNEL]; IN_CH]; OUT_CH],
-    pub bias: [f32; OUT_CH],
-    history: [[f32; IN_CH]; KERNEL],
-    write_pos: usize,
-}
-
-impl<const IN_CH: usize, const OUT_CH: usize, const KERNEL: usize> Conv1D<IN_CH, OUT_CH, KERNEL> {
-    pub fn zeros() -> Self {
-        Self {
-            weights: [[[0.0; KERNEL]; IN_CH]; OUT_CH],
-            bias: [0.0; OUT_CH],
-            history: [[0.0; IN_CH]; KERNEL],
-            write_pos: 0,
-        }
-    }
-
-    #[inline]
-    pub fn forward(&mut self, input: &[f32; IN_CH], output: &mut [f32; OUT_CH]) {
-        self.history[self.write_pos] = *input;
-        self.write_pos = (self.write_pos + 1) % KERNEL;
-
-        for out_ch in 0..OUT_CH {
-            let mut sum = self.bias[out_ch];
-            for k in 0..KERNEL {
-                // PyTorch Conv1d is cross-correlation: weight[k=0] matches newest sample
-                let hist_idx = (self.write_pos + KERNEL - 1 - k) % KERNEL;
-                for in_ch in 0..IN_CH {
-                    sum += self.weights[out_ch][in_ch][k] * self.history[hist_idx][in_ch];
-                }
-            }
-            output[out_ch] = sum;
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.history = [[0.0; IN_CH]; KERNEL];
-        self.write_pos = 0;
-    }
-}
-
-// ============================================================
-// GRU (single time-step, stateful)
-// ============================================================
-
-pub struct GRU<const IN: usize, const HIDDEN: usize> {
-    pub w_z: [[f32; IN]; HIDDEN],
-    pub w_r: [[f32; IN]; HIDDEN],
-    pub w_n: [[f32; IN]; HIDDEN],
-    pub u_z: [[f32; HIDDEN]; HIDDEN],
-    pub u_r: [[f32; HIDDEN]; HIDDEN],
-    pub u_n: [[f32; HIDDEN]; HIDDEN],
-    pub b_iz: [f32; HIDDEN],
-    pub b_ir: [f32; HIDDEN],
-    pub b_in: [f32; HIDDEN],
-    pub b_hz: [f32; HIDDEN],
-    pub b_hr: [f32; HIDDEN],
-    pub b_hn: [f32; HIDDEN],
-    pub h: [f32; HIDDEN],
-}
-
-impl<const IN: usize, const HIDDEN: usize> GRU<IN, HIDDEN> {
-    pub fn zeros() -> Self {
-        Self {
-            w_z: [[0.0; IN]; HIDDEN],
-            w_r: [[0.0; IN]; HIDDEN],
-            w_n: [[0.0; IN]; HIDDEN],
-            u_z: [[0.0; HIDDEN]; HIDDEN],
-            u_r: [[0.0; HIDDEN]; HIDDEN],
-            u_n: [[0.0; HIDDEN]; HIDDEN],
-            b_iz: [0.0; HIDDEN],
-            b_ir: [0.0; HIDDEN],
-            b_in: [0.0; HIDDEN],
-            b_hz: [0.0; HIDDEN],
-            b_hr: [0.0; HIDDEN],
-            b_hn: [0.0; HIDDEN],
-            h: [0.0; HIDDEN],
-        }
-    }
-
-    #[inline]
-    pub fn forward(&mut self, input: &[f32; IN], output: &mut [f32; HIDDEN]) {
-        let mut z = [0.0f32; HIDDEN];
-        let mut r = [0.0f32; HIDDEN];
-        let mut n = [0.0f32; HIDDEN];
-
-        for i in 0..HIDDEN {
-            let mut zv = self.b_iz[i] + self.b_hz[i];
-            for j in 0..IN {
-                zv += self.w_z[i][j] * input[j];
-            }
-            for j in 0..HIDDEN {
-                zv += self.u_z[i][j] * self.h[j];
-            }
-            z[i] = sigmoid(zv);
-
-            let mut rv = self.b_ir[i] + self.b_hr[i];
-            for j in 0..IN {
-                rv += self.w_r[i][j] * input[j];
-            }
-            for j in 0..HIDDEN {
-                rv += self.u_r[i][j] * self.h[j];
-            }
-            r[i] = sigmoid(rv);
-        }
-
-        for i in 0..HIDDEN {
-            let mut nv_input = self.b_in[i];
-            for j in 0..IN {
-                nv_input += self.w_n[i][j] * input[j];
-            }
-
-            let mut nv_hidden = self.b_hn[i];
-            for j in 0..HIDDEN {
-                nv_hidden += self.u_n[i][j] * self.h[j];
-            }
-
-            n[i] = tanh_fast(nv_input + r[i] * nv_hidden);
-        }
-
-        for i in 0..HIDDEN {
-            self.h[i] = (1.0 - z[i]) * n[i] + z[i] * self.h[i];
-            output[i] = self.h[i];
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.h = [0.0; HIDDEN];
-    }
-}
-
-// ============================================================
-// Actual model: conv_pre(1,8,65) → conv_mid(8,8,17) → GRU(8,8) → Dense(8,1)
-// ============================================================
-
-pub struct SaturationModel {
-    conv_pre: Conv1D<1, 8, 65>,
-    conv_mid: Conv1D<8, 8, 17>,
-    gru: GRU<8, 8>,
-    output: Dense<8, 1>,
+pub struct Model {
+    model_json: ModelJson,
+    layer_0: DenseLayer<2, 16>,
+    layer_1: DenseLayer<16, 16>,
+    layer_2: DenseLayer<16, 2>,
     model_latency: usize,
 }
 
-impl SaturationModel {
-    pub fn new() -> Self {
+impl Model {
+    pub fn new_from_json(json_str: &str) -> Self {
+        let model_json = ModelJson::new_from_str(json_str);
+        let counted = model_json.count_parameters();
+        let expected = model_json.expected_parameters();
+        println!(
+            "Loaded model: {} parameters (expected {})",
+            counted, expected
+        );
+        assert_eq!(counted, expected, "Parameter count mismatch in model JSON");
+
+        let layer_0 = DenseLayer::new(
+            vecs_to_matrix::<16, 2>(&model_json.weights(0)),
+            vec_to_vector::<16>(&model_json.bias(0)),
+            model_json.activation(0),
+        );
+
+        let layer_1 = DenseLayer::new(
+            vecs_to_matrix::<16, 16>(&model_json.weights(1)),
+            vec_to_vector::<16>(&model_json.bias(1)),
+            model_json.activation(1),
+        );
+
+        let layer_2 = DenseLayer::new(
+            vecs_to_matrix::<2, 16>(&model_json.weights(2)),
+            vec_to_vector::<2>(&model_json.bias(2)),
+            model_json.activation(2),
+        );
+
+        let model_latency = 0;
+
         Self {
-            conv_pre: Conv1D::zeros(),
-            conv_mid: Conv1D::zeros(),
-            gru: GRU::zeros(),
-            output: Dense::zeros(),
-            model_latency: 0,
+            model_json,
+            layer_0,
+            layer_1,
+            layer_2,
+            model_latency,
+        }
+    }
+
+    pub fn forward(&self, input: Vector<2>) -> Vector<2> {
+        let hidden_1 = self.layer_0.forward(input);
+        let hidden_2 = self.layer_1.forward(hidden_1);
+        self.layer_2.forward(hidden_2)
+    }
+
+    pub fn process(&self, buffer: &mut [&mut [f32]]) {
+        let buffer_size = buffer[0].len();
+
+        for s in 0..buffer_size {
+            let input = Vector::from([buffer[0][s], buffer[1][s]]);
+            let output = self.forward(input);
+
+            buffer[0][s] = output[0];
+            buffer[1][s] = output[1];
         }
     }
 
     pub fn measure_latency(&mut self) -> usize {
-        self.reset();
+        let mut ch0 = [0.0f32; 512];
+        let mut ch1 = [0.0f32; 512];
+        ch0[64] = 1.0;
+        ch1[64] = 1.0;
 
-        // Feed a short burst of noise, compare input/output timing
-        let len = 512;
-        let mut input = vec![0.0f32; len];
-        // Put a click at sample 64 (away from the edge)
-        input[64] = 1.0;
+        let input = ch0; // copy before processing overwrites it
+        let mut buffer: [&mut [f32]; 2] = [&mut ch0, &mut ch1];
+        self.process(&mut buffer);
 
-        let mut output = vec![0.0f32; len];
-        for i in 0..len {
-            output[i] = self.process_sample(input[i]);
-        }
-
-        // Cross-correlate to find the delay
         let max_lag = 128;
-        let mut best_lag = 0;
-        let mut best_corr = 0.0f32;
-
-        for lag in 0..max_lag {
-            let mut corr = 0.0;
-            for i in lag..len {
-                corr += input[i - lag] * output[i];
-            }
-            if corr > best_corr {
-                best_corr = corr;
-                best_lag = lag;
-            }
-        }
+        let (best_lag, _) = (0..max_lag)
+            .map(|lag| {
+                let corr: f32 = (lag..512).map(|i| input[i - lag] * buffer[0][i]).sum();
+                (lag, corr)
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .unwrap();
 
         self.model_latency = best_lag;
         best_lag
-    }
-
-    pub fn latency(&self) -> usize {
-        self.model_latency
-    }
-
-    /// Process one sample. Zero allocations.
-    #[inline]
-    pub fn process_sample(&mut self, input: f32) -> f32 {
-        let mut conv1_out = [0.0f32; 8];
-        self.conv_pre.forward(&[input], &mut conv1_out);
-        for v in &mut conv1_out {
-            *v = v.tanh();
-        }
-
-        let mut conv2_out = [0.0f32; 8];
-        self.conv_mid.forward(&conv1_out, &mut conv2_out);
-        for v in &mut conv2_out {
-            *v = v.tanh();
-        }
-
-        let mut gru_out = [0.0f32; 8];
-        self.gru.forward(&conv2_out, &mut gru_out);
-
-        let mut out = [0.0f32; 1];
-        self.output.forward(&gru_out, &mut out);
-
-        out[0]
-    }
-
-    pub fn reset(&mut self) {
-        self.conv_pre.reset();
-        self.conv_mid.reset();
-        self.gru.reset();
-    }
-
-    /// Load weights from flat f32 slice. Returns number of floats consumed.
-    pub fn load_weights(&mut self, data: &[f32]) -> usize {
-        let mut o = 0;
-
-        // conv_pre: [8, 1, 65] + [8]
-        for oc in 0..8 {
-            for ic in 0..1 {
-                for k in 0..65 {
-                    self.conv_pre.weights[oc][ic][k] = data[o];
-                    o += 1;
-                }
-            }
-        }
-        for i in 0..8 {
-            self.conv_pre.bias[i] = data[o];
-            o += 1;
-        }
-
-        // conv_mid: [8, 8, 17] + [8]
-        for oc in 0..8 {
-            for ic in 0..8 {
-                for k in 0..17 {
-                    self.conv_mid.weights[oc][ic][k] = data[o];
-                    o += 1;
-                }
-            }
-        }
-        for i in 0..8 {
-            self.conv_mid.bias[i] = data[o];
-            o += 1;
-        }
-
-        // GRU: w_ih [r,z,n], w_hh [r,z,n], b_ih [r,z,n], b_hh [r,z,n]
-        for i in 0..8 {
-            for j in 0..8 {
-                self.gru.w_r[i][j] = data[o];
-                o += 1;
-            }
-        }
-        for i in 0..8 {
-            for j in 0..8 {
-                self.gru.w_z[i][j] = data[o];
-                o += 1;
-            }
-        }
-        for i in 0..8 {
-            for j in 0..8 {
-                self.gru.w_n[i][j] = data[o];
-                o += 1;
-            }
-        }
-
-        for i in 0..8 {
-            for j in 0..8 {
-                self.gru.u_r[i][j] = data[o];
-                o += 1;
-            }
-        }
-        for i in 0..8 {
-            for j in 0..8 {
-                self.gru.u_z[i][j] = data[o];
-                o += 1;
-            }
-        }
-        for i in 0..8 {
-            for j in 0..8 {
-                self.gru.u_n[i][j] = data[o];
-                o += 1;
-            }
-        }
-
-        for i in 0..8 {
-            self.gru.b_ir[i] = data[o];
-            o += 1;
-        }
-        for i in 0..8 {
-            self.gru.b_iz[i] = data[o];
-            o += 1;
-        }
-        for i in 0..8 {
-            self.gru.b_in[i] = data[o];
-            o += 1;
-        }
-
-        for i in 0..8 {
-            self.gru.b_hr[i] = data[o];
-            o += 1;
-        }
-        for i in 0..8 {
-            self.gru.b_hz[i] = data[o];
-            o += 1;
-        }
-        for i in 0..8 {
-            self.gru.b_hn[i] = data[o];
-            o += 1;
-        }
-
-        // output: [1, 8] + [1]
-        for i in 0..1 {
-            for j in 0..8 {
-                self.output.weights[i][j] = data[o];
-                o += 1;
-            }
-        }
-        for i in 0..1 {
-            self.output.bias[i] = data[o];
-            o += 1;
-        }
-
-        o // should be 2065
     }
 }
 
@@ -388,30 +139,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_latency() {
-        let mut model = SaturationModel::new();
-        let weights: Vec<f32> =
-            serde_json::from_str(include_str!("../models/weights_causal.json")).unwrap();
-
-        model.load_weights(&weights);
+    fn latency() {
+        let json = include_str!("../models/model.json");
+        let mut model = Model::new_from_json(json);
         let latency = model.measure_latency();
-        println!("Model latency: {}", latency);
-    }
-
-    #[test]
-    fn test_polarity() {
-        let mut model = SaturationModel::new();
-        let weights: Vec<f32> =
-            serde_json::from_str(include_str!("../models/weights_causal.json")).unwrap();
-        model.load_weights(&weights);
-
-        // Feed a positive DC-ish signal
-        model.reset();
-        for _ in 0..100 {
-            model.process_sample(0.5);
-        } // warm up
-        let out = model.process_sample(0.5);
-        println!("Input: 0.5, Output: {}", out);
-        // If output is negative, the model inverts polarity
+        println!("Latency: {}", latency);
+        assert_eq!(latency, 0);
     }
 }
