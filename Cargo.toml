@@ -7,6 +7,6 @@ edition = "2021"
 [dependencies]
 serde_json = "1.0.149"
 serde = { version = "1.0.152", features = ["derive"] }
-keystone = { path = "../keystone" }
-granite = { path = "../granite" }
+keystone = { git = "ssh://git@github.com/vewilya/Keystone.git", branch = "main" }
+granite = { git = "ssh://git@github.com/vewilya/Granite.git", branch = "main" }
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", default-features = false, features = ["assert_process_allocs"] }
