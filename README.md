@@ -1,4 +1,4 @@
-# Lib Neural
+# Torchline
 
 - json_loader
   - Acts as a dummy loader to load the JOSN from file into some data sturctures
