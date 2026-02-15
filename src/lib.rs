@@ -94,7 +94,7 @@ impl NeuralEngine {
 
 #[cfg(test)]
 mod tests {
-    use lib_audio::signal::Signal;
+    use keystone::signal::Signal;
 
     use super::*;
 
