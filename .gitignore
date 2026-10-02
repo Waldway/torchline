@@ -1,2 +1,6 @@
 .DS_Store
- target/
+target/
+__pycache__/
+.ipynb_checkpoints/
+python/audio/*
+!python/audio/.gitkeep
